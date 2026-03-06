@@ -1,8 +1,9 @@
 # casm_offline_frb_injector
 
-Offline FRB injection toolkit for CASM
-Generates filterbank files containing dispersed Gaussian pulses in calibrated
-white noise, then optionally searches them with Hella to measure recovery.
+## Offline FRB injection toolkit for CASM
+
+
+Generates filterbank files containing dispersed Gaussian pulses in white noise, then optionally searches them with Hella (FRB-search code) to measure recovery.
 
 ## What This Does
 
