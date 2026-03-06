@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "casm_offline_frb_injector"
+version = "0.1.0"
+description = "Synthetic FRB injection toolkit for CASM at OVRO"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "casm_io",
+]
+
+[project.optional-dependencies]
+hella = ["pandas"]
+
+[project.scripts]
+inject-frb = "casm_offline_frb_injector.inject_frb:main"
+batch-inject-frbs = "casm_offline_frb_injector.batch_inject_frbs:main"
+run-hella = "casm_offline_frb_injector.run_hella:main"

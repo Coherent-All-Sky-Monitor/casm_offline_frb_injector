@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from inject_frb import (
+from .inject_frb import (
     CASM_FCH1,
     CASM_FOFF,
     CASM_NCHANS,
@@ -122,12 +122,10 @@ class InjectionParameterSampler:
 # BatchInjector
 # ===================================================================
 class BatchInjector:
-    """Run batch FRB injections via subprocess calls to ``inject_frb.py``.
+    """Run batch FRB injections via subprocess calls.
 
     Parameters
     ----------
-    inject_script : Path
-        Path to ``inject_frb.py``.
     outdir : Path
         Output directory for ``.fil`` files and manifest.
     sampler : InjectionParameterSampler
@@ -163,7 +161,6 @@ class BatchInjector:
 
     def __init__(
         self,
-        inject_script: Path,
         outdir: Path,
         sampler: InjectionParameterSampler,
         fch1: float = CASM_FCH1,
@@ -177,7 +174,6 @@ class BatchInjector:
         stop_on_error: bool = False,
         verbose: bool = True,
     ) -> None:
-        self._script = Path(inject_script).resolve()
         self._outdir = Path(outdir).resolve()
         self._sampler = sampler
         self._fch1 = fch1
@@ -215,7 +211,7 @@ class BatchInjector:
                 out_fil = self._outdir / f"{inj_id}.fil"
 
                 cmd = [
-                    sys.executable, str(self._script),
+                    sys.executable, "-m", "casm_offline_frb_injector.inject_frb",
                     "--output", str(out_fil),
                     "--dm", f"{p['dm']:.6f}",
                     "--fwhm", f"{p['fwhm_samples']:.6f}",
@@ -306,9 +302,6 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description="Batch driver to call inject_frb.py for many injections.",
     )
-    ap.add_argument("--inject_script", type=Path,
-                    default=Path(__file__).resolve().parent / "inject_frb.py",
-                    help="Path to inject_frb.py (default: sibling of this script)")
     ap.add_argument("--outdir", required=True, type=Path,
                     help="Output directory for .fil files")
     ap.add_argument("--manifest", default=None, type=Path,
@@ -368,7 +361,6 @@ def main() -> None:
     )
 
     injector = BatchInjector(
-        inject_script=args.inject_script,
         outdir=args.outdir,
         sampler=sampler,
         fch1=args.fch1,

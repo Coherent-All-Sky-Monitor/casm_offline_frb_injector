@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from inject_frb import (
+from .inject_frb import (
     CASM_FCH1,
     CASM_FOFF,
     CASM_NCHANS,

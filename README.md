@@ -14,22 +14,30 @@ Generates filterbank files containing dispersed Gaussian pulses in white noise, 
 3. **`run_hella.py`** -- Run the Hella search pipeline on the injections and
    compare recovered candidates against ground truth.
 
-## Prerequisites
+## Install
 
 ```bash
 source ~/software/dev/casm_venvs/casm_offline_env/bin/activate
 cd ~/software/dev/casm_io && pip install -e .
+cd ~/software/dev/casm_offline_frb_injector && pip install -e .
 ```
 
-This gives you `casm_io`, which provides the filterbank writer, reader, and
-plotting tools used throughout.
+This installs the package and three CLI commands: `inject-frb`,
+`batch-inject-frbs`, and `run-hella`. Source code lives in
+`casm_offline_frb_injector/`:
+
+| CLI command | Source module | Key classes |
+|-------------|--------------|-------------|
+| `inject-frb` | `casm_offline_frb_injector/inject_frb.py` | `GaussianPulse`, `SNRCalibrator`, `FRBInjector` |
+| `batch-inject-frbs` | `casm_offline_frb_injector/batch_inject_frbs.py` | `InjectionParameterSampler`, `BatchInjector` |
+| `run-hella` | `casm_offline_frb_injector/run_hella.py` | `HellaVersion`, `CandidateMatcher`, `ExpectedBoxcar`, `HellaRunner` |
 
 ## Quick Start
 
 ### 1. Inject a single FRB
 
 ```bash
-python inject_frb.py \
+inject-frb \
     -o my_frb.fil \
     --dm 50 \
     --fwhm 2.0 \
@@ -70,7 +78,7 @@ pulse location) and the bottom panel shows the frequency-time waterfall.
 ### 3. Use the classes from Python
 
 ```python
-from inject_frb import FRBInjector
+from casm_offline_frb_injector import FRBInjector
 
 injector = FRBInjector(dm=100, fwhm_samples=4.0, target_snr=30, seed=123)
 result = injector.inject()
@@ -87,7 +95,7 @@ injector.write("output.fil")    # write to disk
 Generate 2000 FRBs with random DM, S/N, and width:
 
 ```bash
-python batch_inject_frbs.py \
+batch-inject-frbs \
     --outdir /data/casm/injections_2k \
     --ninj 2000
 ```
@@ -96,7 +104,7 @@ This writes one `.fil` per injection plus `injections_manifest.csv` with all
 parameters and metadata. Dry-run first to check your commands:
 
 ```bash
-python batch_inject_frbs.py \
+batch-inject-frbs \
     --outdir /data/casm/injections_2k \
     --ninj 5 \
     --dry_run
@@ -118,7 +126,7 @@ All ranges and distributions are CLI-overridable. See `--help` for all options.
 After generating injections, search them with Hella and evaluate recovery:
 
 ```bash
-python run_hella.py \
+run-hella \
     --input_dir /data/casm/injections_2k \
     --gpus 0,1 \
     --versions_to_run v1
