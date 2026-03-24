@@ -9,6 +9,7 @@ description = "Synthetic FRB injection toolkit for CASM at OVRO"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
+    "scipy",
     "casm_io",
 ]
 
@@ -19,3 +20,4 @@ hella = ["pandas"]
 inject-frb = "casm_offline_frb_injector.inject_frb:main"
 batch-inject-frbs = "casm_offline_frb_injector.batch_inject_frbs:main"
 run-hella = "casm_offline_frb_injector.run_hella:main"
+inject-frb-dedigitized = "casm_offline_frb_injector.inject_frb_dedigitized:main"

@@ -153,5 +153,16 @@ output. All are overridable via `--fch1`, `--foff`, etc.
 | `nbits` | 8 | Bits per sample |
 
 
+## De-digitized Injection
 
+`inject-frb-dedigitized` -- same pulse and SNR math as `inject-frb`, but
+adds the signal in continuous space and measures SNR on the actual uint8 output.
+This gives you the SNR you asked for (~99% vs ~65% with the old method).
 
+```bash
+inject-frb-dedigitized -o my_frb.fil --dm 100 --fwhm 5 --snr 20
+inject-frb-dedigitized --input real_obs.fil -o injected.fil --dm 100 --fwhm 5 --snr 20
+inject-frb-dedigitized -o multibeam.fil --dm 100 --fwhm 5 --snr 50 --nbeams 64 --ibeam 0
+```
+
+Validation: `python tests/test_snr_recovery.py` or `pytest tests/test_snr_recovery.py -v`

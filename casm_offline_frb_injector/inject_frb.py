@@ -287,6 +287,13 @@ class FRBInjector:
         Random seed for noise generation.
     verbose : bool
         Print diagnostic information.
+    nbeams : int
+        Number of beams in output filterbank (default 1). When > 1,
+        the FRB is injected into beam *ibeam* and remaining beams are
+        filled with Gaussian noise. Data is written in beam-sequential
+        layout for compatibility with casm_hella_refactored.
+    ibeam : int
+        Beam index (0-based) to inject the FRB into (default 0).
     """
 
     def __init__(
@@ -305,6 +312,8 @@ class FRBInjector:
         position: float = 0.5,
         seed: int | None = None,
         verbose: bool = True,
+        nbeams: int = 1,
+        ibeam: int = 0,
     ) -> None:
         self._dm = float(dm)
         self._fwhm_samples = float(fwhm_samples)
@@ -320,6 +329,13 @@ class FRBInjector:
         self._position = float(position)
         self._seed = seed
         self._verbose = verbose
+        self._nbeams = int(nbeams)
+        self._ibeam = int(ibeam)
+
+        if self._ibeam < 0 or self._ibeam >= self._nbeams:
+            raise ValueError(
+                f"ibeam={self._ibeam} out of range for nbeams={self._nbeams}"
+            )
 
         self._result: dict | None = None
 
@@ -328,7 +344,7 @@ class FRBInjector:
     @property
     def header(self) -> dict:
         """SIGPROC-style header dict for ``write_filterbank``."""
-        return {
+        hdr = {
             "source_name": self._source_name,
             "telescope_id": self._telescope_id,
             "data_type": 1,
@@ -340,7 +356,10 @@ class FRBInjector:
             "tstart": 59000.0,
             "nifs": 1,
             "nsamples": self._nsamples,
+            "nbeams": self._nbeams,
+            "ibeam": self._ibeam,
         }
+        return hdr
 
     @property
     def result(self) -> dict | None:
@@ -357,7 +376,7 @@ class FRBInjector:
         dict
             Keys: dm, fwhm_samples, target_snr, measured_snr,
             optimal_fwhm, pulse_center, sweep_samples, noise_std,
-            data (the final uint8 array).
+            data (the final quantized array).
         """
         rng = np.random.default_rng(self._seed)
 
@@ -400,8 +419,11 @@ class FRBInjector:
             print(f"  Matched filter peak: {calibrator.matched_filter_peak:.2f} "
                   f"(optimal FWHM: {calibrator.optimal_fwhm:.1f} samples)")
             print(f"  Noise std per channel: {noise_std:.6f}")
+            if self._nbeams > 1:
+                print(f"  Multi-beam mode: {self._nbeams} beams, "
+                      f"FRB in beam {self._ibeam}")
 
-        # Add noise
+        # Add noise to signal beam
         noise = rng.normal(0, noise_std, signal.shape).astype(np.float32)
         noisy_data = signal + noise
 
@@ -414,19 +436,26 @@ class FRBInjector:
         if self._verbose:
             print(f"  Measured matched-filter S/N: {measured_snr:.1f}")
 
-        # Quantize to nbits
-        data_mean = np.mean(noisy_data)
-        data_std = np.std(noisy_data)
-        if data_std == 0:
-            data_std = 1.0
-        if self._nbits == 8:
-            scaled = (noisy_data - data_mean) / (4 * data_std) * 127 + 128
-            scaled = np.clip(scaled, 0, 255).astype(np.uint8)
-        elif self._nbits == 16:
-            scaled = (noisy_data - data_mean) / (4 * data_std) * 32767 + 32768
-            scaled = np.clip(scaled, 0, 65535).astype(np.uint16)
+        # Quantize signal beam
+        signal_beam = _quantize(noisy_data, self._nbits)
+
+        if self._nbeams > 1:
+            # Build multi-beam array in beam-sequential layout:
+            # (nbeams, nsamples, nchans) — each beam contiguous, matching hella
+            # This layout matches casm_hella_refactored: beam_data = d_data + ibeam*NTIME*NCHAN.
+            beams = []
+            for b in range(self._nbeams):
+                if b == self._ibeam:
+                    beams.append(signal_beam)
+                else:
+                    beam_noise = rng.normal(
+                        0, noise_std,
+                        (self._nsamples, self._nchans),
+                    ).astype(np.float32)
+                    beams.append(_quantize(beam_noise, self._nbits))
+            scaled = np.stack(beams, axis=0)
         else:
-            scaled = noisy_data
+            scaled = signal_beam
 
         self._result = {
             "dm": self._dm,
@@ -474,6 +503,22 @@ class FRBInjector:
 # ===================================================================
 # Module-level helpers (shared by classes)
 # ===================================================================
+
+def _quantize(data: np.ndarray, nbits: int) -> np.ndarray:
+    """Quantize float32 data to the requested bit depth."""
+    data_mean = np.mean(data)
+    data_std = np.std(data)
+    if data_std == 0:
+        data_std = 1.0
+    if nbits == 8:
+        scaled = (data - data_mean) / (4 * data_std) * 127 + 128
+        return np.clip(scaled, 0, 255).astype(np.uint8)
+    elif nbits == 16:
+        scaled = (data - data_mean) / (4 * data_std) * 32767 + 32768
+        return np.clip(scaled, 0, 65535).astype(np.uint16)
+    else:
+        return data
+
 
 def _dedisperse(
     data: np.ndarray,
@@ -562,6 +607,12 @@ def main() -> None:
                         help="Random seed for reproducibility")
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Suppress diagnostic output")
+    parser.add_argument("--nbeams", type=int, default=1,
+                        help="Number of beams in output (default: 1). "
+                             "When > 1, writes beam-sequential multi-beam "
+                             "filterbank compatible with casm_hella_refactored")
+    parser.add_argument("--ibeam", type=int, default=0,
+                        help="Beam index to inject FRB into (default: 0)")
 
     args = parser.parse_args()
 
@@ -580,6 +631,8 @@ def main() -> None:
         position=args.position,
         seed=args.seed,
         verbose=not args.quiet,
+        nbeams=args.nbeams,
+        ibeam=args.ibeam,
     )
     injector.write(args.output)
 
