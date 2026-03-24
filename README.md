@@ -1,168 +1,88 @@
 # casm_offline_frb_injector
 
-## Offline FRB injection toolkit for CASM
-
-
-Generates filterbank files containing dispersed Gaussian pulses in white noise, then optionally searches them with Hella (FRB-search code) to measure recovery.
-
-## What This Does
-
-1. **`inject_frb.py`** -- Create a single `.fil` file with a fake FRB at a
-   chosen DM, width, and S/N.
-2. **`batch_inject_frbs.py`** -- Generate thousands of injections with random
-   parameters drawn from configurable distributions.
-3. **`run_hella.py`** -- Run the Hella search pipeline on the injections and
-   compare recovered candidates against ground truth.
+Synthetic FRB injection for CASM filterbank files.
 
 ## Install
 
 ```bash
 source ~/software/dev/casm_venvs/casm_offline_env/bin/activate
-cd ~/software/dev/casm_io && pip install -e .
-cd ~/software/dev/casm_offline_frb_injector && pip install -e .
+cd ~/software/dev/casm_io && pip install --no-build-isolation -e .
+cd ~/software/dev/casm_offline_frb_injector && pip install --no-build-isolation -e .
 ```
 
-This installs the package and three CLI commands: `inject-frb`,
-`batch-inject-frbs`, and `run-hella`. Source code lives in
-`casm_offline_frb_injector/`:
+## inject-frb
 
-| CLI command | Source module | Key classes |
-|-------------|--------------|-------------|
-| `inject-frb` | `casm_offline_frb_injector/inject_frb.py` | `GaussianPulse`, `SNRCalibrator`, `FRBInjector` |
-| `batch-inject-frbs` | `casm_offline_frb_injector/batch_inject_frbs.py` | `InjectionParameterSampler`, `BatchInjector` |
-| `run-hella` | `casm_offline_frb_injector/run_hella.py` | `HellaVersion`, `CandidateMatcher`, `ExpectedBoxcar`, `HellaRunner` |
-
-## Quick Start
-
-### 1. Inject a single FRB
+Create a filterbank with a dispersed Gaussian pulse at a given DM, width, and S/N.
 
 ```bash
-inject-frb \
-    -o my_frb.fil \
-    --dm 50 \
-    --fwhm 2.0 \
-    --snr 20 \
-    --seed 42
+inject-frb -o my_frb.fil --dm 50 --fwhm 2 --snr 20
 ```
 
-This creates `my_frb.fil` -- a filterbank file containing a Gaussian pulse
-dispersed to DM = 50 pc/cm^3, with intrinsic FWHM of 2 samples (~2.1 ms) and
-a matched-filter S/N of ~20. The output tells you what happened:
+Multi-beam (64 beams, FRB in beam 0, beam-sequential layout for hella):
 
-```
-Creating Gaussian burst filterbank
-  DM: 50.0 pc/cm^3
-  Intrinsic FWHM: 2.0 samples (2.097 ms)
-  Target S/N: 20.0
-  Dispersion sweep: 506 samples (530.6 ms)
-  Frequency range: 375.031 - 468.750 MHz
-  Channels: 3072, Samples: 4096
-  ...
-  Measured matched-filter S/N: 21.2
-  Written to my_frb.fil
+```bash
+inject-frb -o multibeam.fil --dm 50 --fwhm 2 --snr 20 --nbeams 64 --ibeam 0
 ```
 
-### 2. Plot the dedispersed waterfall
+```python
+from casm_offline_frb_injector import FRBInjector
+
+injector = FRBInjector(dm=100, fwhm_samples=4, target_snr=30)
+injector.write("output.fil")
+```
+
+Note: `inject-frb` calibrates SNR on float32 data before quantizing to uint8.
+The actual SNR in the written file is ~65% of the target. Use
+`inject-frb-dedigitized` for accurate uint8 SNR.
+
+## inject-frb-dedigitized
+
+Same pulse and SNR math as `inject-frb`, but adds the signal in continuous
+space (via probabilistic de-digitization) and iteratively corrects the
+amplitude until the target SNR is achieved on the actual uint8 output.
+
+```bash
+# Synthetic
+inject-frb-dedigitized -o my_frb.fil --dm 100 --fwhm 5 --snr 20
+
+# Into existing filterbank
+inject-frb-dedigitized --input real_obs.fil -o injected.fil --dm 100 --fwhm 5 --snr 20
+
+# Multi-beam
+inject-frb-dedigitized -o multibeam.fil --dm 100 --fwhm 5 --snr 50 --nbeams 64 --ibeam 0
+```
+
+```python
+from casm_offline_frb_injector.inject_frb_dedigitized import inject_synthetic, inject_into_file
+
+data, metadata, header = inject_synthetic(dm=100, target_snr=20, fwhm_samples=5)
+data, metadata, header = inject_into_file("real_obs.fil", dm=100, target_snr=20, fwhm_samples=5)
+```
+
+SNR recovery on uint8 data:
+
+| Target S/N | `inject-frb` | `inject-frb-dedigitized` |
+|-----------|-------------|------------------------|
+| 10 | 6.5 | 9.8 |
+| 20 | 13.1 | 19.7 |
+| 50 | 32.9 | 49.7 |
+| 100 | 68.4 | 99.9 |
+
+Validation: `python tests/test_snr_recovery.py` or `pytest tests/test_snr_recovery.py -v`
+
+## Plot
 
 ```python
 from casm_io.filterbank import FilterbankFile
 from casm_io.filterbank.plotting import plot_dedispersed_waterfall
 
 fb = FilterbankFile("my_frb.fil")
-plot_dedispersed_waterfall(fb.data, fb.header, dm=50, output_path="my_frb_waterfall.png")
+plot_dedispersed_waterfall(fb.data, fb.header, dm=50, output_path="waterfall.png")
 ```
 
-The top panel shows the dedispersed timeseries (you should see a spike at the
-pulse location) and the bottom panel shows the frequency-time waterfall.
-
-### 3. Use the classes from Python
+For multi-beam files:
 
 ```python
-from casm_offline_frb_injector import FRBInjector
-
-injector = FRBInjector(dm=100, fwhm_samples=4.0, target_snr=30, seed=123)
-result = injector.inject()
-
-print(result["measured_snr"])   # actual S/N achieved
-print(result["pulse_center"])   # sample index of pulse at highest freq
-print(result["data"].shape)     # (4096, 3072) uint8 array
-
-injector.write("output.fil")    # write to disk
+fb = FilterbankFile("multibeam.fil", beam=0)
+plot_dedispersed_waterfall(fb.data, fb.header, dm=50, output_path="beam0.png")
 ```
-
-## Batch Injection
-
-Generate 2000 FRBs with random DM, S/N, and width:
-
-```bash
-batch-inject-frbs \
-    --outdir /data/casm/injections_2k \
-    --ninj 2000
-```
-
-This writes one `.fil` per injection plus `injections_manifest.csv` with all
-parameters and metadata. Dry-run first to check your commands:
-
-```bash
-batch-inject-frbs \
-    --outdir /data/casm/injections_2k \
-    --ninj 5 \
-    --dry_run
-```
-
-### Default parameter distributions
-
-| Parameter | Range | Distribution |
-|-----------|-------|-------------|
-| DM | 20 -- 2000 pc/cm^3 | uniform |
-| S/N | 6.5 -- 65 | uniform |
-| Width | 0.262 -- 20 ms | log-uniform |
-| Position | 0.1 -- 0.9 | uniform |
-
-All ranges and distributions are CLI-overridable. See `--help` for all options.
-
-## Running Hella
-
-After generating injections, search them with Hella and evaluate recovery:
-
-```bash
-run-hella \
-    --input_dir /data/casm/injections_2k \
-    --gpus 0,1 \
-    --versions_to_run v1
-```
-
-This creates per-version summary CSVs in `hella_summaries/` with detection
-rates, S/N recovery fractions, and DM accuracy.
-
-The runner is resumable -- if interrupted, re-run the same command and it
-picks up where it left off.
-
-## CASM Instrument Defaults
-
-These are the default filterbank parameters matching the CASM correlator
-output. All are overridable via `--fch1`, `--foff`, etc.
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `fch1` | 468.75 MHz | Top of band |
-| `foff` | -0.030517578125 MHz | Channel width (125/4096, descending) |
-| `nchans` | 3072 | Number of frequency channels |
-| `tsamp` | 0.001048576 s | Sampling time (32.768 us x 32) |
-| `nsamples` | 4096 | Time samples per file (~4.29 s) |
-| `nbits` | 8 | Bits per sample |
-
-
-## De-digitized Injection
-
-`inject-frb-dedigitized` -- same pulse and SNR math as `inject-frb`, but
-adds the signal in continuous space and measures SNR on the actual uint8 output.
-This gives you the SNR you asked for (~99% vs ~65% with the old method).
-
-```bash
-inject-frb-dedigitized -o my_frb.fil --dm 100 --fwhm 5 --snr 20
-inject-frb-dedigitized --input real_obs.fil -o injected.fil --dm 100 --fwhm 5 --snr 20
-inject-frb-dedigitized -o multibeam.fil --dm 100 --fwhm 5 --snr 50 --nbeams 64 --ibeam 0
-```
-
-Validation: `python tests/test_snr_recovery.py` or `pytest tests/test_snr_recovery.py -v`
