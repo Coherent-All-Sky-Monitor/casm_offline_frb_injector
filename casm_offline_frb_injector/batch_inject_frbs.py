@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Batch driver: generate many FRB injection filterbanks by calling
-``inject_frb.py`` as a subprocess for crash-isolation.
+``inject_frb_dedigitized.py`` as a subprocess for crash-isolation.
+
+Supports parallel execution via ``--nworkers``.
 """
 
 from __future__ import annotations
@@ -9,8 +11,11 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import os
 import subprocess
 import sys
+import threading
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +46,7 @@ class InjectionParameterSampler:
     snr_range : tuple[float, float]
         (min, max) for SNR.
     dm_range : tuple[float, float]
-        (min, max) for DM in pc cm⁻³.
+        (min, max) for DM in pc cm-3.
     width_ms_range : tuple[float, float]
         (min, max) for pulse width in ms.
     pos_range : tuple[float, float]
@@ -53,7 +58,7 @@ class InjectionParameterSampler:
     dist_width : str
         Distribution for width.
     tsamp : float
-        Sampling time in seconds (to convert width_ms → fwhm_samples).
+        Sampling time in seconds (to convert width_ms to fwhm_samples).
     """
 
     def __init__(
@@ -121,6 +126,21 @@ class InjectionParameterSampler:
 # ===================================================================
 # BatchInjector
 # ===================================================================
+
+def _run_one_injection(cmd: list[str], out_fil: str) -> tuple[int, bool, str, str]:
+    """Run a single injection subprocess (top-level for pickling).
+
+    Returns
+    -------
+    tuple[int, bool, str, str]
+        (returncode, success, stdout, stderr).
+    """
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    out_path = Path(out_fil)
+    success = proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0
+    return proc.returncode, success, proc.stdout, proc.stderr
+
+
 class BatchInjector:
     """Run batch FRB injections via subprocess calls.
 
@@ -144,6 +164,8 @@ class BatchInjector:
         Bits per sample.
     telescope_id : int
         SIGPROC telescope ID.
+    nworkers : int
+        Number of parallel workers (default: 1 = sequential).
     dry_run : bool
         If True, print commands but do not execute.
     stop_on_error : bool
@@ -170,6 +192,7 @@ class BatchInjector:
         nsamples: int = CASM_NSAMPLES,
         nbits: int = CASM_NBITS,
         telescope_id: int = CASM_TELESCOPE_ID,
+        nworkers: int = 1,
         dry_run: bool = False,
         stop_on_error: bool = False,
         verbose: bool = True,
@@ -183,6 +206,7 @@ class BatchInjector:
         self._nsamples = nsamples
         self._nbits = nbits
         self._telescope_id = telescope_id
+        self._nworkers = max(1, min(nworkers, os.cpu_count() or 16))
         self._dry_run = dry_run
         self._stop_on_error = stop_on_error
         self._verbose = verbose
@@ -202,77 +226,133 @@ class BatchInjector:
         params = self._sampler.parameters
         timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        # Build all jobs first
+        jobs = []
+        for i, p in enumerate(params):
+            inj_id = self._make_id(i, p)
+            out_fil = self._outdir / f"{inj_id}.fil"
+
+            cmd = [
+                sys.executable, "-m", "casm_offline_frb_injector.inject_frb_dedigitized",
+                "--output", str(out_fil),
+                "--dm", f"{p['dm']:.6f}",
+                "--fwhm", f"{p['fwhm_samples']:.6f}",
+                "--snr", f"{p['snr']:.6f}",
+                "--seed", str(p["seed"]),
+                "--fch1", str(self._fch1),
+                "--foff", str(self._foff),
+                "--nchans", str(self._nchans),
+                "--tsamp", str(self._tsamp),
+                "--nsamples", str(self._nsamples),
+                "--nbits", str(self._nbits),
+            ]
+
+            row = {
+                "id": inj_id,
+                "output_fil": str(out_fil),
+                "dm": f"{p['dm']:.6f}",
+                "snr": f"{p['snr']:.6f}",
+                "width_ms": f"{p['width_ms']:.6f}",
+                "tsamp_s": f"{self._tsamp:.12g}",
+                "fwhm_samples": f"{p['fwhm_samples']:.6f}",
+                "seed": str(p["seed"]),
+                "position": f"{p['position']:.6f}",
+                "cmd": " ".join(cmd),
+                "returncode": "",
+                "status": "DRY_RUN" if self._dry_run else "",
+                "timestamp_utc": timestamp,
+            }
+            jobs.append((inj_id, cmd, str(out_fil), row))
+
+        if self._dry_run:
+            with manifest_path.open("w", newline="") as fcsv:
+                writer = csv.DictWriter(fcsv, fieldnames=self._MANIFEST_FIELDS)
+                writer.writeheader()
+                for inj_id, cmd, out_fil, row in jobs:
+                    if self._verbose:
+                        print(row["cmd"])
+                    writer.writerow(row)
+            return manifest_path
+
+        # Write manifest header
+        write_lock = threading.Lock()
         with manifest_path.open("w", newline="") as fcsv:
             writer = csv.DictWriter(fcsv, fieldnames=self._MANIFEST_FIELDS)
             writer.writeheader()
 
-            for i, p in enumerate(params):
-                inj_id = self._make_id(i, p)
-                out_fil = self._outdir / f"{inj_id}.fil"
+        n_ok = 0
+        n_fail = 0
 
-                cmd = [
-                    sys.executable, "-m", "casm_offline_frb_injector.inject_frb",
-                    "--output", str(out_fil),
-                    "--dm", f"{p['dm']:.6f}",
-                    "--fwhm", f"{p['fwhm_samples']:.6f}",
-                    "--snr", f"{p['snr']:.6f}",
-                    "--seed", str(p["seed"]),
-                    "--position", f"{p['position']:.6f}",
-                    "--fch1", str(self._fch1),
-                    "--foff", str(self._foff),
-                    "--nchans", str(self._nchans),
-                    "--tsamp", str(self._tsamp),
-                    "--nsamples", str(self._nsamples),
-                    "--nbits", str(self._nbits),
-                    "--telescope_id", str(self._telescope_id),
-                ]
-                cmd_str = " ".join(cmd)
-
-                row: dict = {
-                    "id": inj_id,
-                    "output_fil": str(out_fil),
-                    "dm": f"{p['dm']:.6f}",
-                    "snr": f"{p['snr']:.6f}",
-                    "width_ms": f"{p['width_ms']:.6f}",
-                    "tsamp_s": f"{self._tsamp:.12g}",
-                    "fwhm_samples": f"{p['fwhm_samples']:.6f}",
-                    "seed": str(p["seed"]),
-                    "position": f"{p['position']:.6f}",
-                    "cmd": cmd_str,
-                    "returncode": "",
-                    "status": "DRY_RUN" if self._dry_run else "",
-                    "timestamp_utc": timestamp,
-                }
-
-                if self._dry_run:
-                    if self._verbose:
-                        print(cmd_str)
-                    writer.writerow(row)
-                    continue
-
-                proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-                row["returncode"] = str(proc.returncode)
-
-                if proc.returncode == 0 and out_fil.exists() and out_fil.stat().st_size > 0:
-                    row["status"] = "OK"
+        if self._nworkers <= 1:
+            # Sequential execution
+            for inj_id, cmd, out_fil, row in jobs:
+                rc, success, stdout, stderr = _run_one_injection(cmd, out_fil)
+                row["returncode"] = str(rc)
+                row["status"] = "OK" if success else "FAIL"
+                self._append_row(manifest_path, row, write_lock)
+                if success:
+                    n_ok += 1
                 else:
-                    row["status"] = "FAIL"
-                    self._write_error(errlog_path, timestamp, inj_id, cmd_str,
-                                      proc.returncode, proc.stdout, proc.stderr)
+                    n_fail += 1
+                    self._write_error(errlog_path, timestamp, inj_id,
+                                      row["cmd"], rc, stdout, stderr)
                     if self._stop_on_error:
-                        writer.writerow(row)
                         raise RuntimeError(f"Injection failed: {inj_id}")
+                if self._verbose:
+                    print(f"  [{n_ok + n_fail}/{len(jobs)}] {inj_id}: {'OK' if success else 'FAIL'}")
+        else:
+            # Parallel execution
+            if self._verbose:
+                print(f"Running {len(jobs)} injections with {self._nworkers} workers...")
+            futures = {}
+            failed = False
+            with ProcessPoolExecutor(max_workers=self._nworkers) as ex:
+                for inj_id, cmd, out_fil, row in jobs:
+                    if failed:
+                        break
+                    fut = ex.submit(_run_one_injection, cmd, out_fil)
+                    futures[fut] = (inj_id, row)
 
-                writer.writerow(row)
+                for fut in as_completed(futures):
+                    inj_id, row = futures[fut]
+                    try:
+                        rc, success, stdout, stderr = fut.result()
+                    except Exception as e:
+                        rc, success, stdout, stderr = -1, False, "", str(e)
+                    row["returncode"] = str(rc)
+                    row["status"] = "OK" if success else "FAIL"
+                    self._append_row(manifest_path, row, write_lock)
+                    if success:
+                        n_ok += 1
+                    else:
+                        n_fail += 1
+                        self._write_error(errlog_path, timestamp, inj_id,
+                                          row["cmd"], rc, stdout, stderr)
+                        if self._stop_on_error:
+                            failed = True
+                            ex.shutdown(wait=False, cancel_futures=True)
+                            break
+                    if self._verbose:
+                        print(f"  [{n_ok + n_fail}/{len(jobs)}] {inj_id}: {'OK' if success else 'FAIL'}")
+            if failed:
+                raise RuntimeError(f"Injection failed: {inj_id}")
 
         if self._verbose:
             print(f"Wrote manifest: {manifest_path}")
-            print(f"Generated: {len(params)} injections")
+            print(f"Generated: {n_ok} OK, {n_fail} FAIL out of {len(params)} injections")
             print(f"Output dir: {self._outdir}")
-            if self._dry_run:
-                print("Dry run: no files were created.")
 
         return manifest_path
+
+    def _append_row(self, manifest_path: Path, row: dict,
+                    lock: threading.Lock) -> None:
+        with lock:
+            with manifest_path.open("a", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=self._MANIFEST_FIELDS,
+                                   extrasaction="ignore")
+                w.writerow(row)
+                f.flush()
+                os.fsync(f.fileno())
 
     @staticmethod
     def _make_id(i: int, p: dict) -> str:
@@ -300,7 +380,7 @@ class BatchInjector:
 # ===================================================================
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Batch driver to call inject_frb.py for many injections.",
+        description="Batch driver to call inject_frb_dedigitized.py for many injections.",
     )
     ap.add_argument("--outdir", required=True, type=Path,
                     help="Output directory for .fil files")
@@ -336,7 +416,10 @@ def main() -> None:
     ap.add_argument("--tsamp", type=float, default=CASM_TSAMP)
     ap.add_argument("--nsamples", type=int, default=CASM_NSAMPLES)
     ap.add_argument("--nbits", type=int, default=CASM_NBITS)
-    ap.add_argument("--telescope_id", type=int, default=CASM_TELESCOPE_ID)
+
+    # Parallelism
+    ap.add_argument("--nworkers", type=int, default=1,
+                    help="Number of parallel workers (default: 1 = sequential)")
 
     # Execution
     ap.add_argument("--dry_run", action="store_true",
@@ -369,7 +452,7 @@ def main() -> None:
         tsamp=args.tsamp,
         nsamples=args.nsamples,
         nbits=args.nbits,
-        telescope_id=args.telescope_id,
+        nworkers=args.nworkers,
         dry_run=args.dry_run,
         stop_on_error=args.stop_on_error,
         verbose=not args.quiet,

@@ -19,6 +19,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from casm_io.candidates import CandidateReader
+
 from .inject_frb import (
     CASM_FCH1,
     CASM_FOFF,
@@ -85,7 +87,7 @@ class ExpectedBoxcar:
         width_ms : float
             Intrinsic pulse width in milliseconds.
         dm : float
-            Dispersion measure in pc cm⁻³.
+            Dispersion measure in pc cm-3.
 
         Returns
         -------
@@ -115,11 +117,30 @@ class CandidateMatcher:
     Parameters
     ----------
     dm_window : float
-        Maximum absolute DM difference for a match (pc cm⁻³).
+        Floor of the DM matching window in pc cm-3.
+    dm_window_frac : float
+        Fractional DM window. Effective window is
+        ``max(dm_window, dm_window_frac * dm_true)``.
     """
 
-    def __init__(self, dm_window: float = 15.0) -> None:
+    def __init__(
+        self,
+        dm_window: float = 15.0,
+        dm_window_frac: float = 0.06,
+    ) -> None:
         self._dm_window = dm_window
+        self._dm_window_frac = dm_window_frac
+
+    def effective_window(self, dm_true: float) -> float:
+        """Compute effective DM matching window.
+
+        Uses ``max(dm_window, dm_window_frac * dm_true)`` where the
+        fractional term (default 6%) accounts for:
+        - 4.63% systematic offset from the TIME_RESOLUTION bug
+          (dt=1.0e-3 vs actual 1.048576e-3, ratio=0.9537)
+        - ~1.4% margin for DM trial spacing scatter (dm_tol=1.3)
+        """
+        return max(self._dm_window, self._dm_window_frac * abs(dm_true))
 
     def match(self, cand_df: pd.DataFrame, dm_true: float) -> dict:
         """Find best candidate within DM window.
@@ -127,7 +148,9 @@ class CandidateMatcher:
         Parameters
         ----------
         cand_df : pandas.DataFrame
-            Candidate table with columns: snr, dm, itime, ibox, etc.
+            Candidate table with columns from CandidateReader: snr,
+            sample_index, time_start, boxcar_width, dm_index, dm,
+            beam_index.
         dm_true : float
             True injection DM.
 
@@ -139,7 +162,8 @@ class CandidateMatcher:
         if cand_df.empty:
             return {"detected": 0, "n_matches": 0, "best": None}
 
-        within = cand_df.loc[(cand_df["dm"] - dm_true).abs() <= self._dm_window]
+        window = self.effective_window(dm_true)
+        within = cand_df.loc[(cand_df["dm"] - dm_true).abs() <= window]
         n_matches = len(within)
         if n_matches == 0:
             return {"detected": 0, "n_matches": 0, "best": None}
@@ -153,7 +177,7 @@ class CandidateMatcher:
 # ===================================================================
 
 HELLA_CFG_TEMPLATE = """\
-INPUT CANDIDATE
+INPUT FILTERBANK
 INPUT_PATH {input_path}
 DM_MIN {dm_min}
 DM_MAX {dm_max}
@@ -161,6 +185,7 @@ WIDTH_MIN {width_min}
 WIDTH_MAX {width_max}
 SNR {snr_min}
 GULP {gulp}
+NBEAM {nbeam}
 OUTPUT FILE
 BEAM0 0
 BEAM_OFFSET 0
@@ -169,6 +194,8 @@ SPEC_MIN {spec_min}
 SPEC_MAX {spec_max}
 OUTPUT_BANDPASS 0
 OUTPUTPATH {output_path}
+SPECFLAGS /dev/null
+BEAMFLAGS /dev/null
 SCRUNCH 2
 4 4 4.0 1
 1 16 4.0 1
@@ -182,7 +209,7 @@ SUMMARY_HEADER = [
     "expected_ibox", "w_intr_samples", "tau_dm_samples", "w_eff_samples",
     "detected", "snr_rec", "recovered_fraction",
     "dm_rec", "dm_diff", "abs_dm_diff",
-    "itime_rec", "ibox_rec", "mjds_rec", "ibeam_rec", "if_rec",
+    "sample_index_rec", "boxcar_width_rec", "time_start_rec", "beam_index_rec",
 ]
 
 
@@ -213,6 +240,8 @@ class HellaRunner:
         Hella config SNR threshold.
     gulp : int
         Hella gulp size.
+    nbeam : int
+        Number of beams (1 for single-beam filterbanks).
     spec_min : float
         Hella spectral index min.
     spec_max : float
@@ -246,9 +275,11 @@ class HellaRunner:
         width_max: int = 65,
         snr_min: float = 6.5,
         gulp: int = CASM_GULP,
+        nbeam: int = 1,
         spec_min: float = -0.07,
         spec_max: float = 0.08,
         dm_window: float = 15.0,
+        dm_window_frac: float = 0.06,
         fch1: float = CASM_FCH1,
         foff: float = CASM_FOFF,
         nchans: int = CASM_NCHANS,
@@ -268,10 +299,11 @@ class HellaRunner:
         self._width_max = width_max
         self._snr_min = snr_min
         self._gulp = gulp
+        self._nbeam = nbeam
         self._spec_min = spec_min
         self._spec_max = spec_max
 
-        self._matcher = CandidateMatcher(dm_window)
+        self._matcher = CandidateMatcher(dm_window, dm_window_frac)
         self._boxcar = ExpectedBoxcar(fch1, foff, nchans, tsamp)
         self._resume_mode = resume_mode
         self._stop_on_error = stop_on_error
@@ -362,6 +394,7 @@ class HellaRunner:
             width_max=str(self._width_max),
             snr_min=f"{self._snr_min:g}",
             gulp=str(self._gulp),
+            nbeam=str(self._nbeam),
             gpu=str(gpu_id),
             spec_min=f"{self._spec_min:g}",
             spec_max=f"{self._spec_max:g}",
@@ -380,7 +413,15 @@ class HellaRunner:
             if proc.stderr:
                 lf.write(f"STDERR:\n{proc.stderr}\n")
 
-        cand_df = self._read_candidates(out_file)
+        # Read candidates using casm_io CandidateReader
+        try:
+            if out_file.exists() and out_file.stat().st_size > 0:
+                cand_df = CandidateReader(str(out_file)).df
+            else:
+                cand_df = pd.DataFrame()
+        except Exception:
+            cand_df = pd.DataFrame()
+
         dm_true = float(inj_row["dm"])
         match = self._matcher.match(cand_df, dm_true)
 
@@ -422,19 +463,19 @@ class HellaRunner:
             "dm_rec": dm_rec,
             "dm_diff": dm_diff,
             "abs_dm_diff": abs_dm_diff,
-            "itime_rec": np.nan,
-            "ibox_rec": np.nan,
-            "mjds_rec": np.nan,
-            "ibeam_rec": np.nan,
-            "if_rec": np.nan,
+            "sample_index_rec": np.nan,
+            "boxcar_width_rec": np.nan,
+            "time_start_rec": np.nan,
+            "beam_index_rec": np.nan,
         }
 
         if detected and best is not None:
-            for key, col in [("itime_rec", "itime"), ("ibox_rec", "ibox"),
-                             ("mjds_rec", "mjds"), ("ibeam_rec", "ibeam"),
-                             ("if_rec", "if")]:
-                if not pd.isna(best[col]):
-                    out[key] = int(best[col]) if col != "mjds" else float(best[col])
+            for key, col in [("sample_index_rec", "sample_index"),
+                             ("boxcar_width_rec", "boxcar_width"),
+                             ("time_start_rec", "time_start"),
+                             ("beam_index_rec", "beam_index")]:
+                if col in best.index and not pd.isna(best[col]):
+                    out[key] = int(best[col]) if col != "time_start" else float(best[col])
 
         return out
 
@@ -450,16 +491,6 @@ class HellaRunner:
         if self._resume_mode == "any":
             return set(df["id"].astype(str))
         return set(df.loc[df["hella_returncode"] == 0, "id"].astype(str))
-
-    @staticmethod
-    def _read_candidates(candfile: Path) -> pd.DataFrame:
-        cols = ["snr", "if", "itime", "mjds", "ibox", "idm", "dm", "ibeam"]
-        if not candfile.exists() or candfile.stat().st_size == 0:
-            return pd.DataFrame(columns=cols)
-        df = pd.read_csv(candfile, header=None, names=cols, sep=r"\s+", engine="python")
-        for c in cols:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df.dropna(subset=["snr", "itime", "dm"])
 
     @staticmethod
     def _atomic_append(csv_path: Path, row: dict, lock: threading.Lock) -> None:
@@ -488,12 +519,11 @@ def main() -> None:
 
     # Hella executables
     ap.add_argument("--hella_v1_exe",
-                    default="/home/ubuntu/vishnu/OFFLINE_T1/AFTER_VIKRAM_CHANGES/"
-                            "dsa110-xengine/src/dsaX_hella_post_boxcar_fix")
-    ap.add_argument("--hella_v1_tag", default="hella_v3.1.0-rc138")
+                    default="/home/casm/software/fourier-space/opt/casm-hella/bin/casm_hella_refactored")
+    ap.add_argument("--hella_v1_tag", default="casm_hella_refactored")
     ap.add_argument("--hella_v2_exe",
-                    default="/home/ubuntu/scratch/dsa110-xengine/src/dsaX_hella_tmp_test")
-    ap.add_argument("--hella_v2_tag", default="hella_v3.1.0-rc125")
+                    default="/home/casm/software/dev/casm-hella-ldunn/build/src/apps/casm_hella_test")
+    ap.add_argument("--hella_v2_tag", default="casm_hella_test")
     ap.add_argument("--versions_to_run", default="v1",
                     help="Comma-separated: v1,v2 (default: v1)")
 
@@ -504,11 +534,15 @@ def main() -> None:
     ap.add_argument("--width_max", type=int, default=65)
     ap.add_argument("--snr_min", type=float, default=6.5)
     ap.add_argument("--gulp", type=int, default=CASM_GULP)
+    ap.add_argument("--nbeam", type=int, default=1,
+                    help="Number of beams (default: 1)")
     ap.add_argument("--spec_min", type=float, default=-0.07)
     ap.add_argument("--spec_max", type=float, default=0.08)
 
     # Matching
     ap.add_argument("--dm_window", type=float, default=15.0)
+    ap.add_argument("--dm_window_frac", type=float, default=0.06,
+                    help="Fractional DM window (default: 0.06 = 6%% of DM)")
 
     # Filterbank params for expected ibox
     ap.add_argument("--fch1", type=float, default=CASM_FCH1)
@@ -556,9 +590,11 @@ def main() -> None:
         width_max=args.width_max,
         snr_min=args.snr_min,
         gulp=args.gulp,
+        nbeam=args.nbeam,
         spec_min=args.spec_min,
         spec_max=args.spec_max,
         dm_window=args.dm_window,
+        dm_window_frac=args.dm_window_frac,
         fch1=args.fch1,
         foff=args.foff,
         nchans=args.nchans,
