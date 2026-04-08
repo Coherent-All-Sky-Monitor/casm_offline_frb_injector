@@ -86,3 +86,40 @@ For multi-beam files:
 fb = FilterbankFile("multibeam.fil", beam=0)
 plot_dedispersed_waterfall(fb.data, fb.header, dm=50, output_path="beam0.png")
 ```
+
+## Batch injection
+
+Generate many injections in parallel. Each injection writes one `.fil` file and one `.json` metadata file. Use `--nworkers` to parallelize across CPU cores; omit it for single-threaded execution.
+
+```bash
+python -m casm_offline_frb_injector.batch_inject_frbs \
+  --outdir /path/to/output \
+  --ninj 500 --snr_min 8 --snr_max 50 \
+  --dm_min 10 --dm_max 1000 \
+  --wms_min 1.048576 --wms_max 67.108864 \
+  --nsamples 32768 --rng_seed 42 --nworkers 16
+```
+
+## Run hella on injections
+
+Runs casm_hella on each filterbank in a directory, matches candidates against the injection truth using `CandidateMatcher`, and writes a summary CSV. GPU indices can be a comma-separated list to spread work across multiple devices.
+
+```bash
+python -m casm_offline_frb_injector.run_hella \
+  --input_dir /path/to/injections \
+  --hella_v1_exe /path/to/casm_hella_refactored \
+  --dm_min 0 --dm_max 1000 --gpus 0
+```
+
+## Recovery plots
+
+Generate diagnostic plots from a batch summary CSV produced by `run_hella`. Pass `--plots all` for the full set, or name individual plots to generate a subset.
+
+```bash
+python -m casm_offline_frb_injector.plot_recovery \
+  --summary /path/to/summary.csv \
+  --outdir /path/to/plots \
+  --plots all
+```
+
+Available plots: `recall_snr`, `recall_dm`, `recall_width`, `snr`, `dm`, `width`, `frac_dm`, `frac_width`, `frac_snr`

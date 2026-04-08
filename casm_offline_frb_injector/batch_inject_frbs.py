@@ -135,7 +135,10 @@ def _run_one_injection(cmd: list[str], out_fil: str) -> tuple[int, bool, str, st
     tuple[int, bool, str, str]
         (returncode, success, stdout, stderr).
     """
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    except OSError as e:
+        return -1, False, "", f"Failed to execute: {e}"
     out_path = Path(out_fil)
     success = proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0
     return proc.returncode, success, proc.stdout, proc.stderr

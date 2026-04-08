@@ -20,8 +20,10 @@ import numpy as np
 import pandas as pd
 
 from casm_io.candidates import CandidateReader
+from casm_io.filterbank import FilterbankFile
 
 from .inject_frb import (
+    _matched_filter_snr,
     CASM_FCH1,
     CASM_FOFF,
     CASM_NCHANS,
@@ -79,8 +81,19 @@ class ExpectedBoxcar:
         self._nu_center = 0.5 * (freq_hi + freq_lo)
         self._chan_bw = abs(foff)
 
+    # The v*v squaring in smooth.cpp narrows the effective kernel FWHM
+    # to ~0.677*sm (measured empirically). A pulse of width w_eff is
+    # best matched by the kernel where 0.677*sm ~ w_eff, i.e.,
+    # sm ~ w_eff / 0.677 ~ 1.48 * w_eff. We find the nearest power-of-2
+    # sm to that value, then convert to boxcar index.
+    _KERNEL_NARROWING = 0.677
+
     def compute(self, width_ms: float, dm: float) -> dict:
         """Compute expected boxcar index.
+
+        Accounts for the v*v kernel narrowing: the kernel at sm has
+        effective FWHM of ~0.677*sm (not sm), so the best-matching
+        kernel for a pulse of width w_eff is sm ~ w_eff / 0.677.
 
         Parameters
         ----------
@@ -97,7 +110,10 @@ class ExpectedBoxcar:
         w_intr = (width_ms / 1000.0) / self._tsamp
         tau_dm = 8.3e3 * dm * self._chan_bw / (self._nu_center ** 3) / self._tsamp
         w_eff = max(math.sqrt(w_intr ** 2 + tau_dm ** 2), 1.0)
-        nearest_pow2 = 2 ** int(round(math.log(w_eff, 2))) if w_eff > 1 else 1
+
+        # Best-matching sm accounts for kernel narrowing
+        best_sm = w_eff / self._KERNEL_NARROWING
+        nearest_pow2 = 2 ** int(round(math.log(max(best_sm, 1), 2)))
         ibox = int(round(math.log(nearest_pow2, 2))) if nearest_pow2 >= 1 else 0
 
         return {
@@ -114,6 +130,9 @@ class ExpectedBoxcar:
 class CandidateMatcher:
     """Match Hella output candidates against injection truth.
 
+    Uses nearest-to-expected matching: filters by DM window AND time
+    window around the expected pulse position, then picks highest SNR.
+
     Parameters
     ----------
     dm_window : float
@@ -121,38 +140,54 @@ class CandidateMatcher:
     dm_window_frac : float
         Fractional DM window. Effective window is
         ``max(dm_window, dm_window_frac * dm_true)``.
+
+        The default 0.06 accounts for:
+        - 4.63% systematic offset from the TIME_RESOLUTION bug
+          (dt=1.0e-3 vs actual 1.048576e-3, ratio=0.9537)
+        - ~1.4% margin for DM trial spacing scatter (dm_tol=1.3)
+    time_window_fwhm_factor : float
+        Time window is ``max(time_window_fwhm_factor * fwhm_samples, 10)``
+        samples around the expected pulse position.
     """
 
     def __init__(
         self,
         dm_window: float = 15.0,
         dm_window_frac: float = 0.06,
+        time_window_fwhm_factor: float = 2.0,
     ) -> None:
         self._dm_window = dm_window
         self._dm_window_frac = dm_window_frac
+        self._time_window_fwhm_factor = time_window_fwhm_factor
 
-    def effective_window(self, dm_true: float) -> float:
-        """Compute effective DM matching window.
-
-        Uses ``max(dm_window, dm_window_frac * dm_true)`` where the
-        fractional term (default 6%) accounts for:
-        - 4.63% systematic offset from the TIME_RESOLUTION bug
-          (dt=1.0e-3 vs actual 1.048576e-3, ratio=0.9537)
-        - ~1.4% margin for DM trial spacing scatter (dm_tol=1.3)
-        """
+    def effective_dm_window(self, dm_true: float) -> float:
+        """Compute effective DM matching window."""
         return max(self._dm_window, self._dm_window_frac * abs(dm_true))
 
-    def match(self, cand_df: pd.DataFrame, dm_true: float) -> dict:
-        """Find best candidate within DM window.
+    def effective_time_window(self, fwhm_samples: float) -> float:
+        """Compute effective time matching window in samples."""
+        return max(self._time_window_fwhm_factor * fwhm_samples, 10.0)
+
+    def match(
+        self,
+        cand_df: pd.DataFrame,
+        dm_true: float,
+        expected_sample: int | None = None,
+        fwhm_samples: float | None = None,
+    ) -> dict:
+        """Find best candidate within DM and time windows.
 
         Parameters
         ----------
         cand_df : pandas.DataFrame
-            Candidate table with columns from CandidateReader: snr,
-            sample_index, time_start, boxcar_width, dm_index, dm,
-            beam_index.
+            Candidate table with columns from CandidateReader.
         dm_true : float
             True injection DM.
+        expected_sample : int, optional
+            Expected pulse sample index. If provided with fwhm_samples,
+            applies a time window filter to avoid matching noise peaks.
+        fwhm_samples : float, optional
+            Pulse FWHM in samples. Used to set the time window width.
 
         Returns
         -------
@@ -162,14 +197,102 @@ class CandidateMatcher:
         if cand_df.empty:
             return {"detected": 0, "n_matches": 0, "best": None}
 
-        window = self.effective_window(dm_true)
-        within = cand_df.loc[(cand_df["dm"] - dm_true).abs() <= window]
+        dm_win = self.effective_dm_window(dm_true)
+        dm_mask = (cand_df["dm"] - dm_true).abs() <= dm_win
+
+        if expected_sample is not None and fwhm_samples is not None:
+            time_win = self.effective_time_window(fwhm_samples)
+            time_mask = (cand_df["sample_index"] - expected_sample).abs() <= time_win
+            within = cand_df.loc[dm_mask & time_mask]
+        else:
+            within = cand_df.loc[dm_mask]
+
         n_matches = len(within)
         if n_matches == 0:
             return {"detected": 0, "n_matches": 0, "best": None}
 
         best_idx = within["snr"].idxmax()
         return {"detected": 1, "n_matches": n_matches, "best": within.loc[best_idx]}
+
+
+# ===================================================================
+# PulseVerifier
+# ===================================================================
+class PulseVerifier:
+    """Independently verify pulse presence via matched-filter on filterbank.
+
+    Reads the filterbank, dedisperses at the known DM, and measures
+    matched-filter SNR using the exact injected pulse width. This gives
+    a ground-truth detection answer independent of hella's normalization.
+
+    Parameters
+    ----------
+    snr_threshold : float
+        Minimum matched-filter SNR to count as verified.
+    """
+
+    def __init__(self, snr_threshold: float = 6.5) -> None:
+        self._threshold = snr_threshold
+
+    def verify(
+        self,
+        fil_path: str | Path,
+        dm: float,
+        fwhm_samples: float,
+        fch1: float = CASM_FCH1,
+        foff: float = CASM_FOFF,
+        tsamp: float = CASM_TSAMP,
+    ) -> dict:
+        """Dedisperse filterbank at known DM and measure matched-filter SNR.
+
+        Parameters
+        ----------
+        fil_path : str | Path
+            Path to the filterbank file.
+        dm : float
+            True dispersion measure.
+        fwhm_samples : float
+            True pulse FWHM in samples.
+        fch1 : float
+            Top frequency in MHz.
+        foff : float
+            Channel bandwidth in MHz.
+        tsamp : float
+            Sampling time in seconds.
+
+        Returns
+        -------
+        dict
+            Keys: verified (bool), mf_snr (float), mf_peak_idx (int).
+        """
+        try:
+            fb = FilterbankFile(str(fil_path), verbose=False)
+            data = fb.data  # (nsamples, nchans)
+            freq_mhz = fb.freq_mhz
+
+            # Dedisperse: shift each channel by DM delay, sum across channels
+            from casm_io.filterbank.plotting import _dedisperse
+            dd = _dedisperse(data, dm, freq_mhz, tsamp)
+            # dd is (nsamples_trimmed, nchans) — average across channels
+            if dd.ndim == 2:
+                ts = dd.mean(axis=1)
+            else:
+                ts = dd
+
+            snr, peak_val, peak_idx = _matched_filter_snr(
+                ts.astype(np.float64), fwhm_samples
+            )
+            return {
+                "verified": bool(snr >= self._threshold),
+                "mf_snr": float(snr),
+                "mf_peak_idx": int(peak_idx),
+            }
+        except Exception as e:
+            return {
+                "verified": False,
+                "mf_snr": np.nan,
+                "mf_peak_idx": -1,
+            }
 
 
 # ===================================================================
@@ -210,6 +333,7 @@ SUMMARY_HEADER = [
     "detected", "snr_rec", "recovered_fraction",
     "dm_rec", "dm_diff", "abs_dm_diff",
     "sample_index_rec", "boxcar_width_rec", "time_start_rec", "beam_index_rec",
+    "verified", "mf_snr", "mf_peak_idx",
 ]
 
 
@@ -286,6 +410,7 @@ class HellaRunner:
         tsamp: float = CASM_TSAMP,
         resume_mode: str = "ok",
         stop_on_error: bool = False,
+        verify: bool = True,
     ) -> None:
         self._input_dir = Path(input_dir).resolve()
         self._versions = versions
@@ -307,6 +432,8 @@ class HellaRunner:
         self._boxcar = ExpectedBoxcar(fch1, foff, nchans, tsamp)
         self._resume_mode = resume_mode
         self._stop_on_error = stop_on_error
+        self._verify = verify
+        self._verifier = PulseVerifier(snr_min) if verify else None
 
     def run(self) -> None:
         """Execute the Hella search across all versions and injections."""
@@ -477,6 +604,18 @@ class HellaRunner:
                 if col in best.index and not pd.isna(best[col]):
                     out[key] = int(best[col]) if col != "time_start" else float(best[col])
 
+        # Independent matched-filter verification
+        if self._verifier is not None:
+            fwhm_samp = float(inj_row["fwhm_samples"])
+            vr = self._verifier.verify(input_fil, dm_true, fwhm_samp)
+            out["verified"] = vr["verified"]
+            out["mf_snr"] = vr["mf_snr"]
+            out["mf_peak_idx"] = vr["mf_peak_idx"]
+        else:
+            out["verified"] = np.nan
+            out["mf_snr"] = np.nan
+            out["mf_peak_idx"] = np.nan
+
         return out
 
     def _load_completed(self, summary_path: Path) -> set[str]:
@@ -558,6 +697,8 @@ def main() -> None:
     # Resume
     ap.add_argument("--resume_mode", choices=["ok", "any", "none"], default="ok")
     ap.add_argument("--stop_on_error", action="store_true")
+    ap.add_argument("--no_verify", action="store_true",
+                    help="Disable independent matched-filter verification")
 
     args = ap.parse_args()
 
@@ -601,6 +742,7 @@ def main() -> None:
         tsamp=args.tsamp,
         resume_mode=args.resume_mode,
         stop_on_error=args.stop_on_error,
+        verify=not args.no_verify,
     )
     runner.run()
 

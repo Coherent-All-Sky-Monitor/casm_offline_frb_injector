@@ -196,7 +196,7 @@ def inject_frb(
 
         dd = _dedisperse(
             injected.astype(np.float32),
-            pulse._dm, pulse._fch1, pulse._foff, pulse._tsamp,
+            pulse.dm, pulse.fch1, pulse.foff, pulse.tsamp,
         )
         measured_snr = calibrator.measure_snr(dd)
 
@@ -212,7 +212,7 @@ def inject_frb(
             scale_factor *= target_snr / measured_snr
 
     metadata = {
-        "dm": pulse._dm,
+        "dm": pulse.dm,
         "fwhm_samples": fwhm_samples,
         "target_snr": target_snr,
         "measured_snr": float(measured_snr),

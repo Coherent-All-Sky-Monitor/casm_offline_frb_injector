@@ -93,14 +93,15 @@ class RecoveryAnalyzer:
         """Merge multiple summary CSVs."""
         frames = [pd.read_csv(p) for p in csvs]
         merged = pd.concat(frames, ignore_index=True)
-        import tempfile
-        with tempfile.NamedTemporaryFile(
-            suffix=".csv", mode="w", delete=False
-        ) as tf:
-            merged.to_csv(tf, index=False)
-            tmp = Path(tf.name)
-        obj = cls(tmp)
-        tmp.unlink(missing_ok=True)
+        obj = cls.__new__(cls)
+        obj._path = None
+        obj.df = merged
+        missing = cls._REQUIRED_COLS - set(merged.columns)
+        if missing:
+            raise ValueError(
+                f"Summary CSV missing columns: {missing}. "
+                f"Available: {list(merged.columns)}"
+            )
         return obj
 
     @property
@@ -258,7 +259,7 @@ class RecoveryPlotter:
             ax.scatter(mis["snr_injected"], [0] * len(mis),
                        marker="x", c="0.45", s=20, linewidths=0.8,
                        zorder=2, label=f"Missed ({len(mis)})")
-            ax.legend(fontsize=8, frameon=False)
+            ax.legend(fontsize=8, frameon=False, loc="lower right")
 
         ax.set_xlabel("Injected SNR", fontsize=10)
         ax.set_ylabel("Recovered SNR", fontsize=10)
@@ -267,9 +268,9 @@ class RecoveryPlotter:
         _apply_style(ax)
 
         if len(det) > 0:
-            med = det["recovered_fraction"].median()
-            _add_text(ax, f"Median recovery: {med:.0%}\n"
-                          f"N detected: {len(det)}/{self.analyzer.n_injections}")
+            _add_text(ax, f"N detected: {len(det)}/{self.analyzer.n_injections} "
+                          f"({len(det)/self.analyzer.n_injections:.0%})",
+                      loc="upper left")
         fig.tight_layout()
         return self._save(fig, filename)
 
@@ -346,14 +347,14 @@ class RecoveryPlotter:
             n_total = int(matrix.sum())
             pct = f"{n_match/n_total:.0%}" if n_total > 0 else "N/A"
             _add_text(ax, f"Exact: {n_match}/{n_total} ({pct})",
-                      loc="lower right")
+                      loc="upper left")
 
         ax.set_xticks(range(n_box))
         ax.set_xticklabels(labels, fontsize=7)
         ax.set_yticks(range(n_box))
         ax.set_yticklabels(labels, fontsize=7)
-        ax.set_xlabel("Expected boxcar width", fontsize=10)
-        ax.set_ylabel("Recovered boxcar width", fontsize=10)
+        ax.set_xlabel("Expected width\n"r"$\mathrm{sm} = \mathrm{pow2}(w_{\mathrm{eff}}\, /\, 0.677)$,  "r"$w_{\mathrm{eff}} = \sqrt{w_{\mathrm{intr}}^2 + \tau_{\mathrm{DM}}^2}$", fontsize=8)
+        ax.set_ylabel("Recovered width", fontsize=10)
         # Don't despine imshow plots
         for spine in ax.spines.values():
             spine.set_visible(True)

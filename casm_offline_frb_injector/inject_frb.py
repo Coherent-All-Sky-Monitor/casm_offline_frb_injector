@@ -23,7 +23,7 @@ CASM_FCH1: float = 468.75                # MHz, top of band
 CASM_FOFF: float = -0.030517578125       # MHz, 125/4096, descending
 CASM_NCHANS: int = 3072                  # full resolution
 CASM_TSAMP: float = 0.001048576          # s, 32.768 µs × 32
-CASM_NSAMPLES: int = 4096               # tobs ≈ 4.29 s
+CASM_NSAMPLES: int = 32768              # tobs ≈ 34.4 s, supports DM up to 1000
 CASM_NBITS: int = 8
 CASM_TELESCOPE_ID: int = 20             # OVRO
 
@@ -87,6 +87,31 @@ class GaussianPulse:
         self._dispersed: np.ndarray | None = None
 
     # -- properties ---------------------------------------------------------
+
+    @property
+    def dm(self) -> float:
+        """Dispersion measure in pc cm-3."""
+        return self._dm
+
+    @property
+    def fch1(self) -> float:
+        """Top frequency in MHz."""
+        return self._fch1
+
+    @property
+    def foff(self) -> float:
+        """Channel bandwidth in MHz."""
+        return self._foff
+
+    @property
+    def tsamp(self) -> float:
+        """Sampling time in seconds."""
+        return self._tsamp
+
+    @property
+    def nchans(self) -> int:
+        """Number of frequency channels."""
+        return self._nchans
 
     @property
     def sweep_samples(self) -> int:
